@@ -1,9 +1,0 @@
-pyproject.toml
-src/kkmacro.egg-info/PKG-INFO
-src/kkmacro.egg-info/SOURCES.txt
-src/kkmacro.egg-info/dependency_links.txt
-src/kkmacro.egg-info/requires.txt
-src/kkmacro.egg-info/top_level.txt
-src/sructuralvar/__init__.py
-src/sructuralvar/cleaning.py
-src/sructuralvar/svar.py
