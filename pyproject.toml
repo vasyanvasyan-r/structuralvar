@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "structuralvar"
+version = "0.0.1"
+description = "Cleaning + SVAR tools (research beta)"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pandas", "scipy", "statsmodels", "matplotlib"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

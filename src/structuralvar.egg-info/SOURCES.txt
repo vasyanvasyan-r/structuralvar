@@ -1,0 +1,9 @@
+pyproject.toml
+src/sructuralvar/__init__.py
+src/sructuralvar/cleaning.py
+src/sructuralvar/svar.py
+src/structuralvar.egg-info/PKG-INFO
+src/structuralvar.egg-info/SOURCES.txt
+src/structuralvar.egg-info/dependency_links.txt
+src/structuralvar.egg-info/requires.txt
+src/structuralvar.egg-info/top_level.txt
