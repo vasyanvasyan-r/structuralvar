@@ -99,7 +99,7 @@ class Clean:
                        add_const : bool = True) -> Tuple[
                                                          np.ndarray, # Z
                                                          np.ndarray, # Y
-                                                         np.ndarray, # B_hat
+                                                         np.ndarray, # A_hat
                                                          np.ndarray, # E
                                                          int, int # K and T
                                                          ]:
@@ -112,7 +112,7 @@ class Clean:
             Regressor matrix with constant and lags.
         Y : np.ndarray
             Matrix of dependent variables.
-        B_hat : np.ndarray
+        A_hat : np.ndarray
             Estimated coefficient matrix.
         """
         if from_class:
@@ -134,9 +134,9 @@ class Clean:
 
         Y = X[:, :Z.shape[1]]
 
-        B_hat = Y @ Z.T @ np.linalg.inv(Z @ Z.T)
+        A_hat = Y @ Z.T @ np.linalg.inv(Z @ Z.T)
 
-        return Z, Y, B_hat, Y - B_hat @ Z, X.shape[0], T
+        return Z, Y, A_hat, Y - A_hat @ Z, X.shape[0], T
     
     def remove_na(self,
                   series : pd.Series = None, # type: ignore
@@ -214,7 +214,7 @@ class Clean:
             'best_r2': float,
             'residuals': np.array(n,),
             'yhat': np.array(n,),
-            'B_hat': np.array((k,)),
+            'A_hat': np.array((k,)),
             'Z_best': np.array((k,n)),
             'diagnostics': {...}
         }
@@ -251,7 +251,7 @@ class Clean:
                     'best_r2': np.var(trend)/np.var(y),
                     'residuals': cycle,
                     'yhat': trend,
-                    'B_hat': 6.25/period**4,
+                    'A_hat': 6.25/period**4,
                     'Z_best': None,
                     'names': ['hp_filter'],
                     'diagnostics': None
@@ -361,7 +361,7 @@ class Clean:
                         'best_r2': r2,
                         'residuals': np.exp(error) if exp_aprox else error,
                         'yhat': yhat,
-                        'B_hat': beta,
+                        'A_hat': beta,
                         'Z_best': Z.copy(),
                         'names': names,
                         'diagnostics': diagnostics.copy()
@@ -377,7 +377,7 @@ class Clean:
                     'best_r2': 1,
                     'residuals': series,
                     'yhat': series,
-                    'B_hat': np.array([series.iloc[0].item() if n == 'const' else 0 for n in names]),
+                    'A_hat': np.array([series.iloc[0].item() if n == 'const' else 0 for n in names]),
                     'Z_best': Z.copy(),
                     'names': names,
                     'diagnostics': diagnostics.copy()
@@ -570,7 +570,7 @@ class Clean:
             for lag in range(1, lag_max):
 
 
-                Z, Y, B_hat, E, K, T = self.OLS_estimation(Nseries=X, lag = lag, from_class=False)
+                Z, Y, A_hat, E, K, T = self.OLS_estimation(Nseries=X, lag = lag, from_class=False)
 
                 u = (E @ E.T)
 

@@ -195,13 +195,13 @@ class SVAR_KL:
         # --------- OLS outputs (filled by fit_ols) ----------
         self.Y: Optional[np.ndarray] = None         # (K, T-p)
         self.Z: Optional[np.ndarray] = None         # (nreg, T-p)
-        self.B_hat: Optional[np.ndarray] = None     # (K, nreg)
+        self.A_hat: Optional[np.ndarray] = None     # (K, nreg)
         self.E: Optional[np.ndarray] = None         # (K, T-p)
         self.Sigma_u: Optional[np.ndarray] = None   # (K, K)
         self.P: Optional[np.ndarray] = None         # (K, K) Cholesky of Sigma_u (lower)
 
         # convenience slices
-        self.B_hat_endo: Optional[np.ndarray] = None      # (K, 1+Kp) if const else (K, Kp)
+        self.A_hat_endo: Optional[np.ndarray] = None      # (K, 1+Kp) if const else (K, Kp)
         self.A_endo_no_const: Optional[np.ndarray] = None # (K, Kp)
 
         # --------- identification outputs ----------
@@ -347,15 +347,15 @@ class SVAR_KL:
     # ----------------- 2) OLS estimation -----------------
     def fit_ols(self) -> "SVAR_KL":
         """
-        Estimates: Y = B_hat Z + E  (KL matrix form)
+        Estimates: Y = A_hat Z + E  (KL matrix form)
         Stores attributes similar to your OLS_estimation output.
         """
         Y, Z = self._build_YZ()
-        # B_hat = Y Z' (Z Z')^{-1}
+        # A_hat = Y Z' (Z Z')^{-1}
         ZZt = Z @ Z.T
         YZt = Y @ Z.T
-        B_hat = YZt @ np.linalg.inv(ZZt)
-        E = Y - B_hat @ Z
+        A_hat = YZt @ np.linalg.inv(ZZt)
+        E = Y - A_hat @ Z
 
         # Sigma_u (unbiased-ish): E E' / (T-p - nreg) is common; KL often uses / (T-p)
         # We'll store both pieces later if you want. For now: / (T-p).
@@ -366,15 +366,15 @@ class SVAR_KL:
             raise ImportError("scipy is required for Cholesky decomposition.")
         P = cholesky(Sigma_u, lower=True)
 
-        self.Y, self.Z, self.B_hat, self.E = Y, Z, B_hat, E
+        self.Y, self.Z, self.A_hat, self.E = Y, Z, A_hat, E
         self.Sigma_u, self.P = Sigma_u, P
 
         # convenience: endog-only coefficient block
         # Z contains [const?; lags; exog?]. We split the endog part = const + K*p.
         endo_reg_count = (1 if self.add_const else 0) + self.K * self.p
-        self.B_hat_endo = B_hat[:, :endo_reg_count]
+        self.A_hat_endo = A_hat[:, :endo_reg_count]
         # A_endo_no_const: remove constant if present
-        self.A_endo_no_const = self.B_hat_endo[:, 1:] if self.add_const else self.B_hat_endo.copy()
+        self.A_endo_no_const = self.A_hat_endo[:, 1:] if self.add_const else self.A_hat_endo.copy()
 
         return self
 
@@ -450,10 +450,10 @@ class SVAR_KL:
     # ----------------- 6) Combined identification via minimization -----------------
     def identify_combined(
         self,
-        short_run_zeros: Sequence[Tuple[int, int]] = (),
-        long_run_zeros: Sequence[Tuple[int, int]] = (),
-        short_sign_restrictions: Sequence[Tuple[int, int, int, int]] = (),
-        long_sign_restrictions: Sequence[Tuple[int, int, int]] = (),
+        short_run_SAP: Sequence[Tuple[float, int, int, int, float]] = [],
+        long_run_SAP: Sequence[Tuple[float, int, int, float]] = [],
+        short_run_NAP: Sequence[Tuple[float, int, int, bool, int, float]] = [],
+        long_run_NAP: Sequence[Tuple[float, int, int, bool, float]] = [],
         horizon_for_short_sign: Optional[int] = None,  # used only for sanity check
         n_starts: int = 50,
         seed: Optional[int] = None,
@@ -461,13 +461,15 @@ class SVAR_KL:
     ) -> RestrictionResult:
         """
         Minimizes a penalty to satisfy:
-          - short_run_zeros on B0inv (impact)
-          - long_run_zeros on Cinf
-          - short_sign_restrictions on IRF(h)
-          - long_sign_restrictions on Cinf
+          - short_run_symmetric_around_point on B0inv (impact)
+          - long_run_symmetric_around_point on Cinf
+          - short_sign_narrative_around_point IRF(h)
+          - long_sign_narrative_around_point on Cinf
 
-        short_sign_restrictions: (row, col, h, sign)
-        long_sign_restrictions: (row, col, sign)
+        short_run_SAP: (target, row, col, horizon, weight)
+        long_run_SAP: (target, row, col, weight)
+        short_run_NAP: (target, row, col, sign(True if the irf should be greater that the target, False otherwise), horizon, weight)
+        long_run_NAP: (target, row, col, sign(True if the irf should be greater that the target, False otherwise), weight)
         """
         if minimize is None:
             raise ImportError("scipy is required for optimization-based identification.")
@@ -480,7 +482,7 @@ class SVAR_KL:
 
         # Small validation (optional)
         if horizon_for_short_sign is not None:
-            for (_, _, h, _) in short_sign_restrictions:
+            for (_, _, _, _, h, _) in short_run_NAP:
                 if h > horizon_for_short_sign:
                     raise ValueError("A short-run sign restriction has h > horizon_for_short_sign.")
 
@@ -488,40 +490,54 @@ class SVAR_KL:
             Q = _givens_Q_from_params(params, K)
             B0inv = self.P @ Q
             Upsilon = _long_run_matrix(self.A_endo_no_const, B0inv)
-
+            if short_run_SAP and short_run_NAP:
+                max_h = max(h[-2] for h in short_run_SAP + short_run_NAP)
+                irfs = _irf_companion(self.A_endo_no_const, B0inv, horizon=max_h)
             loss = 0.0
 
-            # short-run zeros (quadratic)
-            for (i, j) in short_run_zeros:
-                loss += float(B0inv[i, j] ** 2)
+            # short-run target (quadratic)
+            if short_run_SAP:
+                for (target, row, col, h, whght) in short_run_SAP:
+                    v = irfs[h, row, col]
+                    loss += whght * float((target - v) ** 2)
 
-            # long-run zeros (quartic, stronger)
-            for (i, j) in long_run_zeros:
-                loss += float(Upsilon[i, j] ** 4)
+            # long-run target (quartic)
+            if long_run_SAP:
+                for (target, row, col, whght) in long_run_SAP:
+                    loss += whght * float((target - Upsilon[row, col]) ** 2)
 
-            # short-run sign restrictions (via IRF)
-            if short_sign_restrictions:
-                max_h = max(h for (_, _, h, _) in short_sign_restrictions)
-                irfs = _irf_companion(self.A_endo_no_const, B0inv, horizon=max_h)
-                for (r, c, h, sgn) in short_sign_restrictions:
-                    v = irfs[h, r, c]
+            # short-run narrative restrictions (via IRF)
+            if short_run_NAP:        
+                for (target, row, col, sgn, h, whght) in short_run_NAP:
+                    v = irfs[h, row, col]
                     # smooth asymmetric penalty: exp(-sgn*v)-1
-                    loss += float(np.exp(-sgn * v) - 1.0)
+                    if sgn:
+                        loss += whght * float(np.exp(-1 * (v-target)) - 1.0)
+                    else:
+                        loss += whght * float(np.exp(v-target) - 1.0)
 
-            # long-run sign restrictions on Cinf
-            for (r, c, sgn) in long_sign_restrictions:
-                v = Upsilon[r, c]
-                loss += float(np.exp(-sgn * v) - 1.0)
+            
+            # long-run sign restrictions on Upsilon
+            if long_run_NAP:
+                      
+                for (target, row, col, sgn, whght) in long_run_NAP:
+                    v = Upsilon[row, col]
+                    if sgn:
+                        loss += whght * float(np.exp(-1 * (v-target)) - 1.0)
+                    else:
+                        loss += whght * float(np.exp(v-target) - 1.0)
 
             return loss
 
         best = {"fun": np.inf, "x": None, "res": None}
-
+        drops = {}
         for s in range(n_starts):
             x0 = rng.uniform(0.0, 2 * np.pi, size=n_params)
             res = minimize(penalty, x0=x0, method=method)
             if res.fun < best["fun"]:
                 best = {"fun": float(res.fun), "x": res.x.copy(), "res": res}
+            else:
+                drops[s] = {"fun": float(res.fun), "x": res.x.copy(), "res": res, "Q": _givens_Q_from_params(res.x.copy(), K)}
 
         if best["x"] is None:
             raise RuntimeError("Optimization failed for all starts.")
@@ -567,7 +583,7 @@ class SVAR_KL:
         Residual bootstrap (basic): resample reduced-form residuals columns with replacement,
         simulate series using fitted VAR, refit OLS.
         """
-        if self.B_hat_endo is None or self.E is None or self.A_endo_no_const is None:
+        if self.A_hat_endo is None or self.E is None or self.A_endo_no_const is None:
             raise RuntimeError("Call fit_ols() first.")
         if scheme == "fixed_Q" and self.Q is None:
             raise RuntimeError("scheme='fixed_Q' requires stored Q from identify_*.")
@@ -579,7 +595,7 @@ class SVAR_KL:
 
         # Extract reduced-form A's and const
         if self.add_const:
-            c = self.B_hat_endo[:, [0]]  # (K,1)
+            c = self.A_hat_endo[:, [0]]  # (K,1)
             A_no_const = self.A_endo_no_const  # (K,Kp)
         else:
             c = None
