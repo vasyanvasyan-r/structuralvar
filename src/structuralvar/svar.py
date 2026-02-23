@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Literal, Any
 
 import numpy as np
 import pandas as pd
-
+from plotting import plot_hd_bars_signed, plot_irf_single, plot_irf_grid # type: ignore
 try:
     from scipy.linalg import cholesky, qr
     from scipy.optimize import minimize
@@ -43,11 +43,11 @@ def _random_orthogonal(K: int, rng: np.random.Generator) -> np.ndarray:
     if qr is None:
         raise ImportError("scipy is required for QR-based random orthogonal draws.")
     A = rng.standard_normal((K, K))
-    Q, R = qr(A)
+    Q, R = qr(A) # type: ignore
     # Fix sign ambiguity for reproducibility-ish
     d = np.sign(np.diag(R))
     d[d == 0] = 1.0
-    return Q * d
+    return Q * d # type: ignore
 
 
 def _build_companion(A_endo_no_const: np.ndarray, K: int, p: int) -> np.ndarray:
@@ -143,6 +143,8 @@ class SVAR_KL:
         p: int,
         exog: Optional[pd.DataFrame] = None,
         layout: Optional[Layout] = None,
+        u_dict: list = [None],
+        y_dict: list = [None],
         time_order: TimeOrder = "KL_reverse",
         add_const: bool = True,
         check_binary_collinearity: bool = True,
@@ -163,6 +165,9 @@ class SVAR_KL:
         self.layout = self._infer_layout(data, layout=layout)
         self.X, self.var_names, self.time_index = self._coerce_to_KT(data, layout=self.layout)
         self.K, self.T = self.X.shape
+        self.y_dict = {k:v for k, v in zip(self.var_names, y_dict)}
+        self.u_dict = {k:v for k, v in zip(self.var_names, u_dict)}
+
 
         if self.T <= self.p:
             raise ValueError(f"Need T > p. Got T={self.T}, p={self.p}")
@@ -177,12 +182,7 @@ class SVAR_KL:
             self.exog = E
             self.exog_names = ex_names
 
-        if self.time_order == "chronological":
-            # превращаем chrono (oldest->newest) в KL_reverse (newest->oldest)
-            self.X = self.X[:, ::-1]
-            if self.exog is not None:
-                self.exog = self.exog[:, ::-1]
-        elif self.time_order != "KL_reverse":
+        if self.time_order not in ["chronological", "KL_reverse"]:
             raise ValueError(f"Unknown time_order: {self.time_order}")
         
         self._validate_values(self.X, label="endog")
@@ -315,32 +315,61 @@ class SVAR_KL:
     # ----------------- VAR: build Y,Z in KL order -----------------
     def _build_YZ(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        KL_reverse (default): X[:,0] newest, X[:,-1] oldest.
-        For VAR(p), usable obs = T-p (columns 0..T-p-1).
+        Build Y and Z matrices for VAR(p) estimation.
+        
+        Chronological mode (col 0 = oldest, col -1 = newest):
+        - Y uses the LAST nobs columns (most recent observations).
+        - Lags are shifted to the LEFT (older data).
         """
         X = self.X
-        K, T = X.shape
+        K, T = self.X.shape
         p = self.p
         nobs = T - p
 
-        # Y = [X_t, X_{t-1}, ..., X_{p+1}]  -> first T-p columns
-        Y = X[:, :nobs]  # (K, T-p)
+        if self.time_order == "chronological":
+            # --- ХРОНОЛОГИЧЕСКИЙ ПОРЯДОК (0=oldest, -1=newest) ---
+            
+            # Y: берем последние nobs наблюдений (индексы от p до T-1)
+            # Пример: T=10, p=3 -> Y = X[:, 3:10] (7 наблюдений)
+            Y = X[:, p:]  # (K, T-p)
 
-        Z_blocks = []
-        if self.add_const:
-            Z_blocks.append(np.ones((1, nobs)))
+            Z_blocks = []
+            if self.add_const:
+                Z_blocks.append(np.ones((1, nobs)))
 
-        # lag i: shift right by i
-        for i in range(1, p + 1):
-            Z_blocks.append(X[:, i:i + nobs])  # (K, T-p)
+            # Лаги: сдвигаем окно ВЛЕВО на i позиций
+            # Если Y это [p : T], то лаг i это [p-i : T-i]
+            # Пример для i=1: X[:, 2:9] (когда Y_t на индексе 3, лаг на индексе 2)
+            for i in range(1, p + 1):
+                Z_blocks.append(X[:, p - i : T - i])  # (K, T-p)
 
-        Z = np.vstack(Z_blocks)  # (1+Kp, T-p) or (Kp, T-p)
+            Z = np.vstack(Z_blocks)
 
-        # Optional: append exog contemporaneous (aligned with Y) if provided
-        # NOTE: you can extend later with lagged exog; пока — минимально.
-        if self.exog is not None:
-            E = self.exog[:, :nobs]  # align same columns as Y
-            Z = np.vstack([Z, E])
+            # Exog: выравниваем по тем же индексам, что и Y
+            if self.exog is not None:
+                E = self.exog[:, p:]
+                Z = np.vstack([Z, E])
+                
+        else:
+            # --- KL_REVERSE ПОРЯДОК (0=newest, -1=oldest) ---
+            # (Оставляем старую логику для совместимости, если нужно)
+            
+            # Y: берем первые nobs наблюдений (они же самые новые в этом порядке)
+            Y = X[:, :nobs]  # (K, T-p)
+
+            Z_blocks = []
+            if self.add_const:
+                Z_blocks.append(np.ones((1, nobs)))
+
+            # Лаги: сдвигаем окно ВПРАВО на i позиций (в сторону старых данных)
+            for i in range(1, p + 1):
+                Z_blocks.append(X[:, i : i + nobs])  # (K, T-p)
+
+            Z = np.vstack(Z_blocks)
+
+            if self.exog is not None:
+                E = self.exog[:, :nobs]
+                Z = np.vstack([Z, E])
 
         return Y, Z
 
@@ -450,10 +479,10 @@ class SVAR_KL:
     # ----------------- 6) Combined identification via minimization -----------------
     def identify_combined(
         self,
-        short_run_SAP: Sequence[Tuple[float, int, int, int, float]] = [],
-        long_run_SAP: Sequence[Tuple[float, int, int, float]] = [],
-        short_run_NAP: Sequence[Tuple[float, int, int, bool, int, float]] = [],
-        long_run_NAP: Sequence[Tuple[float, int, int, bool, float]] = [],
+        short_run_anchor: Sequence[Tuple[float, int, int, int, float]] = [],
+        long_run_anchor: Sequence[Tuple[float, int, int, float]] = [],
+        short_run_signs: Sequence[Tuple[float, int, int, bool, int, float]] = [],
+        long_run_signs: Sequence[Tuple[float, int, int, bool, float]] = [],
         horizon_for_short_sign: Optional[int] = None,  # used only for sanity check
         n_starts: int = 50,
         seed: Optional[int] = None,
@@ -461,15 +490,15 @@ class SVAR_KL:
     ) -> RestrictionResult:
         """
         Minimizes a penalty to satisfy:
-          - short_run_symmetric_around_point on B0inv (impact)
-          - long_run_symmetric_around_point on Cinf
-          - short_sign_narrative_around_point IRF(h)
-          - long_sign_narrative_around_point on Cinf
+          - short_run_anchor on B0inv (impact)
+          - long_run_anchor on Cinf
+          - short_sign_signs IRF(h) narrative assymetric restrictions
+          - long_sign_signs on Cinf narrative assymetric restrictions
 
-        short_run_SAP: (target, row, col, horizon, weight)
-        long_run_SAP: (target, row, col, weight)
-        short_run_NAP: (target, row, col, sign(True if the irf should be greater that the target, False otherwise), horizon, weight)
-        long_run_NAP: (target, row, col, sign(True if the irf should be greater that the target, False otherwise), weight)
+        short_run_anchor: (target, row, col, horizon, weight)
+        long_run_anchor: (target, row, col, weight)
+        short_run_signs: (target, row, col, sign(True if the irf should be greater that the target, False otherwise), horizon, weight)
+        long_run_signs: (target, row, col, sign(True if the irf should be greater that the target, False otherwise), weight)
         """
         if minimize is None:
             raise ImportError("scipy is required for optimization-based identification.")
@@ -482,33 +511,38 @@ class SVAR_KL:
 
         # Small validation (optional)
         if horizon_for_short_sign is not None:
-            for (_, _, _, _, h, _) in short_run_NAP:
+            for (_, _, _, _, h, _) in short_run_signs:
                 if h > horizon_for_short_sign:
                     raise ValueError("A short-run sign restriction has h > horizon_for_short_sign.")
 
         def penalty(params: np.ndarray) -> float:
             Q = _givens_Q_from_params(params, K)
             B0inv = self.P @ Q
+            if self.A_endo_no_const is not None:
+                Upsilon = _long_run_matrix(self.A_endo_no_const, B0inv)
+            else:
+                raise ValueError("A_endo_no_const is not initialized")
             Upsilon = _long_run_matrix(self.A_endo_no_const, B0inv)
-            if short_run_SAP and short_run_NAP:
-                max_h = max(h[-2] for h in short_run_SAP + short_run_NAP)
+            if short_run_anchor and short_run_signs:
+                combined = list(short_run_anchor) + list(short_run_signs)
+                max_h = max(h[-2] for h in combined) 
                 irfs = _irf_companion(self.A_endo_no_const, B0inv, horizon=max_h)
             loss = 0.0
 
             # short-run target (quadratic)
-            if short_run_SAP:
-                for (target, row, col, h, whght) in short_run_SAP:
+            if short_run_anchor:
+                for (target, row, col, h, whght) in short_run_anchor:
                     v = irfs[h, row, col]
                     loss += whght * float((target - v) ** 2)
 
             # long-run target (quartic)
-            if long_run_SAP:
-                for (target, row, col, whght) in long_run_SAP:
+            if long_run_anchor:
+                for (target, row, col, whght) in long_run_anchor:
                     loss += whght * float((target - Upsilon[row, col]) ** 2)
 
             # short-run narrative restrictions (via IRF)
-            if short_run_NAP:        
-                for (target, row, col, sgn, h, whght) in short_run_NAP:
+            if short_run_signs:        
+                for (target, row, col, sgn, h, whght) in short_run_signs:
                     v = irfs[h, row, col]
                     # smooth asymmetric penalty: exp(-sgn*v)-1
                     if sgn:
@@ -518,9 +552,9 @@ class SVAR_KL:
 
             
             # long-run sign restrictions on Upsilon
-            if long_run_NAP:
+            if long_run_signs:
                       
-                for (target, row, col, sgn, whght) in long_run_NAP:
+                for (target, row, col, sgn, whght) in long_run_signs:
                     v = Upsilon[row, col]
                     if sgn:
                         loss += whght * float(np.exp(-1 * (v-target)) - 1.0)
@@ -643,7 +677,7 @@ class SVAR_KL:
                 data=pd.DataFrame(X_b, index=self.var_names, columns=self.time_index),
                 p=self.p,
                 layout="KL_KxT",
-                time_order=self.time_order,
+                time_order=self.time_order, # pyright: ignore[reportArgumentType]
                 add_const=self.add_const,
                 check_binary_collinearity=False,
                 name=f"{self.name}_boot{b}",
@@ -651,10 +685,10 @@ class SVAR_KL:
 
             if scheme == "redo_cholesky":
                 Q_b = np.eye(K)
-                B0inv_b = tmp.P @ Q_b
+                B0inv_b = tmp.P @ Q_b # pyright: ignore[reportOptionalOperand]
 
             elif scheme == "fixed_Q":
-                B0inv_b = tmp.P @ self.Q
+                B0inv_b = tmp.P @ self.Q # pyright: ignore[reportOptionalOperand]
 
             elif scheme == "redo_sign":
                 rr = tmp.identify_sign_restrictions(
@@ -678,7 +712,9 @@ class SVAR_KL:
         return irf_draws
 
     # ----------------- 8) Historical decomposition -----------------
-    def historical_decomposition(self, B0inv: Optional[np.ndarray] = None) -> np.ndarray:
+    def historical_decomposition(self, 
+                                 B0inv: Optional[np.ndarray] = None, 
+                                 plot_hd = False) -> list:
         """
         Returns contributions: (K, nobs, K) where contributions[:,t,j] is the contribution
         of shock j to variables at time t (aligned with Y columns, KL order).
@@ -695,7 +731,7 @@ class SVAR_KL:
 
         # structural shocks: u_t = B0inv * eps_t  => eps_t = B0 * u_t
         B0 = np.linalg.inv(B0inv)
-        eps = B0 @ self.E  # (K, nobs)
+        Us = B0 @ self.E  # (K, nobs)
 
         # MA representation coefficients Phi_h = J' A_comp^h J (KxK)
         # contributions at time t: sum_{h=0..t} Phi_h B0inv e_{t-h} (with decomposition by shock)
@@ -708,8 +744,32 @@ class SVAR_KL:
             # y_t = sum_{h=0..t} irfs[h] @ eps_{t-h}
             # to decompose by shock j, take column j of irfs[h] times eps_j
             for h in range(t + 1):
-                e = eps[:, t - h]  # (K,)
+                u = Us[:, t - h]  # (K,)
                 # add per shock
                 for j in range(K):
-                    contrib[:, t, j] += irfs[h][:, j] * e[j]
-        return contrib
+                    contrib[:, t, j] += irfs[h][:, j] * u[j]
+
+        dec_list = []
+        for v in range(self.K):
+            dec_list.append(pd.DataFrame(np.vstack([self.Y[v],  # pyright: ignore[reportOptionalSubscript]
+                                 contrib[v, :, :].T]),
+                 index = [self.y_dict[self.var_names[v]]] + [self.u_dict[i] for i in self.var_names],
+                 columns = self.time_index[self.p:]))
+        if plot_hd:
+            for v in range(self.K):
+                plot_hd_bars_signed(dec_list[v],
+                                    cumm = True) # pyright: ignore[reportCallIssue]
+        return dec_list
+    def plot_irfs_grid(self,
+                      irf_sims: list, # follow that rule index = 0 is the original irf, the others are sims
+                      horizon_plot: int, 
+                      main_color: str = "cadetblue"):
+        #check of the horizon
+        if horizon_plot > irf_sims[0].shape[0] - 1:
+            horizon_plot = irf_sims[0].shape[0] - 1
+            print('The horizon_plot is greater than it is simulated. Max horizon was obtained from sims')
+        plot_irf_grid(irf_sims = irf_sims,
+                      y_labels = list(self.y_dict.values()),
+                      u_labels = list(self.u_dict.values()),
+                      horizon = horizon_plot,
+                      ci_color = main_color)
